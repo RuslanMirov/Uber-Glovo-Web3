@@ -1,5 +1,4 @@
-require("@nomicfoundation/hardhat-ethers");
-require("@nomicfoundation/hardhat-chai-matchers");
+require("@nomicfoundation/hardhat-toolbox");
 
 module.exports = {
   solidity: {
@@ -7,11 +6,6 @@ module.exports = {
     settings: {
       optimizer: { enabled: true, runs: 200 },
       evmVersion: "cancun",
-    },
-  },
-  networks: {
-    hardhat: {
-      hardfork: "cancun",
     },
   },
 };
