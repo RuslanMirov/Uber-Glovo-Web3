@@ -1,18 +1,15 @@
 const { ethers } = require("hardhat");
+const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
-/**
- * Demonstrates the full Glovo Onchain lifecycle on a local Hardhat node.
- * Run:  npx hardhat run scripts/demo.js
- */
 async function main() {
   const [admin, courier, client] = await ethers.getSigners();
   const fmt = ethers.formatEther;
+  const TWO_DAYS = 2 * 24 * 3600;
 
   console.log("╔═══════════════════════════════════════╗");
   console.log("║      GLOVO ONCHAIN — DEMO FLOW        ║");
   console.log("╚═══════════════════════════════════════╝\n");
 
-  // ── Deploy ──
   const Registry = await ethers.getContractFactory("CourierRegistry");
   const registry = await Registry.deploy();
   await registry.waitForDeployment();
@@ -20,90 +17,71 @@ async function main() {
   const Service = await ethers.getContractFactory("OrderService");
   const service = await Service.deploy(await registry.getAddress());
   await service.waitForDeployment();
-
   console.log("✓ Contracts deployed\n");
 
-  // ── Register courier ──
-  const tx1 = await registry.connect(admin).addCourier(courier.address);
-  await tx1.wait();
-  console.log(`✓ Courier registered  →  NFT #${await registry.courierToken(courier.address)}`);
-  console.log(`  Address: ${courier.address}\n`);
+  // Register courier
+  await (await registry.addCourier(courier.address)).wait();
+  console.log(`✓ Courier registered → NFT #${await registry.courierToken(courier.address)}\n`);
 
-  // ── Client places order ──
-  const orderValue = ethers.parseEther("0.5");
-  const tx2 = await service.connect(client).createOrder("2x Margherita Pizza + Coke", { value: orderValue });
-  await tx2.wait();
-  console.log(`✓ Order #0 created by client`);
-  console.log(`  Payment: ${fmt(orderValue)} ETH`);
-  console.log(`  Details: "2x Margherita Pizza + Coke"\n`);
+  // ── Happy path: no dispute ──
+  console.log("── HAPPY PATH ──");
+  await (await service.connect(client).createOrder("2x Margherita + Coke", { value: ethers.parseEther("0.5") })).wait();
+  console.log("✓ Order #0 created (0.5 ETH)");
 
-  // ── Courier picks up ──
-  const tx3 = await service.connect(courier).pickUpOrder(0);
-  await tx3.wait();
-  console.log("✓ Courier picked up order #0\n");
+  await (await service.connect(courier).pickUpOrder(0)).wait();
+  console.log("✓ Courier picked up");
 
-  // ── Courier delivers ──
-  const tx4 = await service.connect(courier).markDelivered(0);
-  await tx4.wait();
-  console.log("✓ Courier marked order #0 as delivered\n");
+  await (await service.connect(courier).markDelivered(0)).wait();
+  const deadline = await service.disputeDeadline(0);
+  console.log(`✓ Courier marked done — dispute window open until block ts ${deadline}`);
 
-  // ── Client confirms with 5-star rating ──
-  const tx5 = await service.connect(client).confirmDelivery(0, 5);
-  await tx5.wait();
+  // Client rates (optional, doesn't block)
+  await (await service.connect(client).rateOrder(0, 5)).wait();
+  console.log("✓ Client rated ⭐ 5/5");
 
-  const courierBal = await service.courierBalance(courier.address);
-  const platformFees = await service.platformFees();
-  console.log("✓ Client confirmed delivery (⭐ 5/5)");
-  console.log(`  Courier balance:  ${fmt(courierBal)} ETH`);
-  console.log(`  Platform fees:    ${fmt(platformFees)} ETH\n`);
+  // Wait 2 days — no dispute
+  await time.increase(TWO_DAYS + 1);
+  console.log("  ⏳ 2 days passed, no dispute...");
 
-  // ── Courier stats ──
+  await (await service.finalizeOrder(0)).wait();
+  const bal = await service.courierBalance(courier.address);
+  console.log(`✓ Finalized! Courier balance: ${fmt(bal)} ETH (after 5% fee)\n`);
+
+  // ── Dispute path ──
+  console.log("── DISPUTE PATH ──");
+  await (await service.connect(client).createOrder("Cold sushi :(", { value: ethers.parseEther("0.3") })).wait();
+  await (await service.connect(courier).pickUpOrder(1)).wait();
+  await (await service.connect(courier).markDelivered(1)).wait();
+  console.log("✓ Order #1 delivered");
+
+  await (await service.connect(client).disputeOrder(1)).wait();
+  console.log("✓ Client disputed within 2-day window");
+
+  await (await service.freezeOrder(1)).wait();
+  console.log("✓ Admin froze order");
+
+  const clientBefore = await ethers.provider.getBalance(client.address);
+  await (await service.resolveDispute(1, true)).wait();
+  const clientAfter = await ethers.provider.getBalance(client.address);
+  console.log(`✓ Admin refunded client: +${fmt(clientAfter - clientBefore)} ETH\n`);
+
+  // ── Courier withdrawal ──
+  console.log("── COURIER WITHDRAWAL ──");
+  const courierBefore = await ethers.provider.getBalance(courier.address);
+  const tx = await service.connect(courier).withdraw();
+  const receipt = await tx.wait();
+  const gas = receipt.gasUsed * receipt.gasPrice;
+  const courierAfter = await ethers.provider.getBalance(courier.address);
+  console.log(`✓ Courier withdrew: ${fmt(courierAfter + gas - courierBefore)} ETH`);
+
+  // Stats
   const tokenId = await registry.courierToken(courier.address);
   const info = await registry.couriers(tokenId);
   const avg = await registry.averageRating(tokenId);
-  console.log("── Courier NFT Stats ──");
-  console.log(`  Orders completed: ${info.ordersCount}`);
-  console.log(`  Average rating:   ${Number(avg) / 100}/5.00`);
-  console.log(`  Active:           ${info.active}\n`);
-
-  // ── Courier withdraws ──
-  const balBefore = await ethers.provider.getBalance(courier.address);
-  const tx6 = await service.connect(courier).withdraw();
-  const receipt = await tx6.wait();
-  const balAfter = await ethers.provider.getBalance(courier.address);
-  const gasCost = receipt.gasUsed * receipt.gasPrice;
-
-  console.log("✓ Courier withdrew earnings");
-  console.log(`  Net received: ${fmt(balAfter + gasCost - balBefore)} ETH`);
-  console.log(`  Gas cost:     ${fmt(gasCost)} ETH\n`);
-
-  // ── Dispute flow demo ──
-  console.log("── Dispute Flow ──");
-  const tx7 = await service.connect(client).createOrder("Cold sushi :(", { value: ethers.parseEther("0.3") });
-  await tx7.wait();
-  await (await service.connect(courier).pickUpOrder(1)).wait();
-  await (await service.connect(courier).markDelivered(1)).wait();
-
-  await (await service.connect(client).disputeOrder(1)).wait();
-  console.log("✓ Client disputed order #1");
-
-  await (await service.connect(admin).freezeOrder(1)).wait();
-  console.log("✓ Admin froze order #1");
-
-  const clientBalBefore = await ethers.provider.getBalance(client.address);
-  await (await service.connect(admin).resolveDispute(1, true)).wait();
-  const clientBalAfter = await ethers.provider.getBalance(client.address);
-  console.log(`✓ Admin refunded client: +${fmt(clientBalAfter - clientBalBefore)} ETH\n`);
-
-  const order1 = await service.getOrder(1);
-  console.log(`  Order #1 final status: ${["Created","PickedUp","Delivered","Completed","Disputed","Frozen","Refunded","Cancelled"][Number(order1.status)]}`);
+  console.log(`\n── Courier NFT #${tokenId} ──`);
+  console.log(`  Orders: ${info.ordersCount} | Rating: ${Number(avg)/100}/5.00 | Active: ${info.active}`);
 
   console.log("\n✅ Demo complete!");
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+main().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });

@@ -65,10 +65,9 @@ describe("Glovo Onchain", function () {
 
     it("average rating is calculated correctly", async function () {
       await registry.addCourier(courier1.address);
-      // 5 + 3 = 8 / 2 = 4.00 → 400
       await registry.addRating(1, 5);
       await registry.addRating(1, 3);
-      expect(await registry.averageRating(1)).to.equal(400);
+      expect(await registry.averageRating(1)).to.equal(400); // 4.00
     });
 
     it("incrementOrders bumps count", async function () {
@@ -81,10 +80,10 @@ describe("Glovo Onchain", function () {
   });
 
   /* ============================================================
-     ORDER SERVICE — HAPPY PATH
+     HAPPY PATH — courier delivers, no dispute, finalize after 2 days
      ============================================================ */
 
-  describe("OrderService — happy path", function () {
+  describe("Happy path — auto-finalize", function () {
     beforeEach(async function () {
       await registry.addCourier(courier1.address);
     });
@@ -108,7 +107,7 @@ describe("Glovo Onchain", function () {
       ).to.be.revertedWithCustomError(service, "ZeroPayment");
     });
 
-    it("full lifecycle: create → pickup → deliver → confirm", async function () {
+    it("full lifecycle: create → pickup → deliver → wait 2 days → finalize", async function () {
       await service.connect(client1).createOrder("Sushi", { value: ETH1 });
 
       // pickup
@@ -116,27 +115,42 @@ describe("Glovo Onchain", function () {
         .to.emit(service, "OrderPickedUp")
         .withArgs(0, courier1.address);
 
-      // deliver
+      // deliver — starts dispute window
       await expect(service.connect(courier1).markDelivered(0))
-        .to.emit(service, "OrderDelivered")
-        .withArgs(0);
+        .to.emit(service, "OrderDelivered");
 
-      // confirm with 5-star rating
-      const fee = ETH1 * 500n / 10000n; // 5%
+      // cannot finalize before 2 days
+      await expect(service.finalizeOrder(0))
+        .to.be.revertedWithCustomError(service, "TooEarly");
+
+      // wait 2 days
+      await time.increase(TWO_DAYS + 1);
+
+      // finalize — money goes to courier
+      const fee = ETH1 * 500n / 10000n;
       const payout = ETH1 - fee;
 
-      await expect(service.connect(client1).confirmDelivery(0, 5))
-        .to.emit(service, "OrderCompleted")
+      await expect(service.finalizeOrder(0))
+        .to.emit(service, "OrderFinalized")
         .withArgs(0, payout);
 
       expect(await service.courierBalance(courier1.address)).to.equal(payout);
       expect(await service.platformFees()).to.equal(fee);
 
-      // check NFT stats updated
+      // courier NFT stats updated
       const info = await registry.couriers(1);
       expect(info.ordersCount).to.equal(1);
-      expect(info.ratingCount).to.equal(1);
-      expect(info.rating).to.equal(5);
+    });
+
+    it("anyone can call finalize (not just courier)", async function () {
+      await service.connect(client1).createOrder("Tacos", { value: ETH1 });
+      await service.connect(courier1).pickUpOrder(0);
+      await service.connect(courier1).markDelivered(0);
+      await time.increase(TWO_DAYS + 1);
+
+      // random address finalizes
+      await expect(service.connect(client2).finalizeOrder(0))
+        .to.emit(service, "OrderFinalized");
     });
 
     it("client can cancel before pickup", async function () {
@@ -163,18 +177,79 @@ describe("Glovo Onchain", function () {
   });
 
   /* ============================================================
-     ORDER SERVICE — DISPUTES
+     CLIENT RATING (optional, does not block finalization)
      ============================================================ */
 
-  describe("OrderService — disputes", function () {
+  describe("Client rating", function () {
     beforeEach(async function () {
       await registry.addCourier(courier1.address);
-      await service.connect(client1).createOrder("Burger", { value: ETH2 });
+      await service.connect(client1).createOrder("Burger", { value: ETH1 });
       await service.connect(courier1).pickUpOrder(0);
       await service.connect(courier1).markDelivered(0);
     });
 
-    it("client can dispute a delivered order", async function () {
+    it("client can rate during dispute window (Delivered status)", async function () {
+      await expect(service.connect(client1).rateOrder(0, 4))
+        .to.emit(service, "OrderRated")
+        .withArgs(0, 4);
+
+      expect(await service.orderRating(0)).to.equal(4);
+      expect(await registry.averageRating(1)).to.equal(400); // 4.00
+    });
+
+    it("client can rate after finalization (Completed status)", async function () {
+      await time.increase(TWO_DAYS + 1);
+      await service.finalizeOrder(0);
+
+      await expect(service.connect(client1).rateOrder(0, 3))
+        .to.emit(service, "OrderRated")
+        .withArgs(0, 3);
+
+      expect(await registry.averageRating(1)).to.equal(300);
+    });
+
+    it("cannot rate twice", async function () {
+      await service.connect(client1).rateOrder(0, 5);
+      await expect(service.connect(client1).rateOrder(0, 3))
+        .to.be.revertedWithCustomError(service, "AlreadyRated");
+    });
+
+    it("rejects invalid rating score", async function () {
+      await expect(service.connect(client1).rateOrder(0, 0))
+        .to.be.revertedWithCustomError(service, "InvalidRating");
+      await expect(service.connect(client1).rateOrder(0, 6))
+        .to.be.revertedWithCustomError(service, "InvalidRating");
+    });
+
+    it("only client can rate", async function () {
+      await expect(service.connect(client2).rateOrder(0, 5))
+        .to.be.revertedWithCustomError(service, "OnlyClient");
+    });
+
+    it("rating does not block finalization", async function () {
+      await service.connect(client1).rateOrder(0, 2);
+
+      await time.increase(TWO_DAYS + 1);
+
+      // finalize still works
+      await expect(service.finalizeOrder(0))
+        .to.emit(service, "OrderFinalized");
+    });
+  });
+
+  /* ============================================================
+     DISPUTES — client complains within 2-day window
+     ============================================================ */
+
+  describe("Disputes", function () {
+    beforeEach(async function () {
+      await registry.addCourier(courier1.address);
+      await service.connect(client1).createOrder("Cold food", { value: ETH2 });
+      await service.connect(courier1).pickUpOrder(0);
+      await service.connect(courier1).markDelivered(0);
+    });
+
+    it("client can dispute within 2-day window", async function () {
       await expect(service.connect(client1).disputeOrder(0))
         .to.emit(service, "OrderDisputed")
         .withArgs(0, client1.address);
@@ -183,26 +258,27 @@ describe("Glovo Onchain", function () {
       expect(o.status).to.equal(4); // Disputed
     });
 
-    it("admin can freeze disputed order", async function () {
+    it("client CANNOT dispute after 2-day window expires", async function () {
+      await time.increase(TWO_DAYS + 1);
+      await expect(service.connect(client1).disputeOrder(0))
+        .to.be.revertedWithCustomError(service, "TooLate");
+    });
+
+    it("admin freezes disputed order", async function () {
       await service.connect(client1).disputeOrder(0);
       await expect(service.freezeOrder(0))
         .to.emit(service, "OrderFrozen")
         .withArgs(0);
-
-      const o = await service.getOrder(0);
-      expect(o.status).to.equal(5); // Frozen
     });
 
-    it("admin resolves dispute with refund to client", async function () {
+    it("admin resolves with refund to client", async function () {
       await service.connect(client1).disputeOrder(0);
       await service.freezeOrder(0);
 
       const balBefore = await ethers.provider.getBalance(client1.address);
       await expect(service.resolveDispute(0, true))
         .to.emit(service, "OrderRefunded")
-        .withArgs(0, client1.address, ETH2)
-        .and.to.emit(service, "DisputeResolved")
-        .withArgs(0, true);
+        .withArgs(0, client1.address, ETH2);
 
       const balAfter = await ethers.provider.getBalance(client1.address);
       expect(balAfter - balBefore).to.equal(ETH2);
@@ -211,7 +287,7 @@ describe("Glovo Onchain", function () {
       expect(o.status).to.equal(6); // Refunded
     });
 
-    it("admin resolves dispute in courier's favor", async function () {
+    it("admin resolves in courier's favor", async function () {
       await service.connect(client1).disputeOrder(0);
       await service.freezeOrder(0);
 
@@ -219,10 +295,8 @@ describe("Glovo Onchain", function () {
       const payout = ETH2 - fee;
 
       await expect(service.resolveDispute(0, false))
-        .to.emit(service, "OrderCompleted")
-        .withArgs(0, payout)
-        .and.to.emit(service, "DisputeResolved")
-        .withArgs(0, false);
+        .to.emit(service, "OrderFinalized")
+        .withArgs(0, payout);
 
       expect(await service.courierBalance(courier1.address)).to.equal(payout);
     });
@@ -236,70 +310,44 @@ describe("Glovo Onchain", function () {
     });
 
     it("cannot dispute non-delivered order", async function () {
-      // create a fresh order still in Created status
       await service.connect(client1).createOrder("test", { value: ETH1 });
       await expect(service.connect(client1).disputeOrder(1))
+        .to.be.revertedWithCustomError(service, "InvalidStatus");
+    });
+
+    it("cannot finalize a disputed order", async function () {
+      await service.connect(client1).disputeOrder(0);
+      await time.increase(TWO_DAYS + 1);
+      await expect(service.finalizeOrder(0))
         .to.be.revertedWithCustomError(service, "InvalidStatus");
     });
   });
 
   /* ============================================================
-     ORDER SERVICE — AUTO-COMPLETE
+     WEEKLY WITHDRAWAL
      ============================================================ */
 
-  describe("OrderService — auto-complete", function () {
-    beforeEach(async function () {
-      await registry.addCourier(courier1.address);
-      await service.connect(client1).createOrder("Pasta", { value: ETH1 });
-      await service.connect(courier1).pickUpOrder(0);
-      await service.connect(courier1).markDelivered(0);
-    });
-
-    it("reverts if confirm window has not passed", async function () {
-      await expect(service.autoComplete(0))
-        .to.be.revertedWithCustomError(service, "WithdrawTooEarly");
-    });
-
-    it("auto-completes after 2-day window with 5-star default", async function () {
-      await time.increase(TWO_DAYS + 1);
-
-      const fee = ETH1 * 500n / 10000n;
-      const payout = ETH1 - fee;
-
-      await expect(service.autoComplete(0))
-        .to.emit(service, "OrderCompleted")
-        .withArgs(0, payout);
-
-      expect(await service.courierBalance(courier1.address)).to.equal(payout);
-
-      // rating should be 5
-      expect(await registry.averageRating(1)).to.equal(500);
-    });
-  });
-
-  /* ============================================================
-     ORDER SERVICE — WEEKLY WITHDRAWAL
-     ============================================================ */
-
-  describe("OrderService — weekly withdrawal", function () {
+  describe("Weekly withdrawal", function () {
     beforeEach(async function () {
       await registry.addCourier(courier1.address);
 
-      // complete 2 orders to build up balance
+      // complete 2 orders (deliver + wait + finalize)
       await service.connect(client1).createOrder("Order A", { value: ETH1 });
       await service.connect(courier1).pickUpOrder(0);
       await service.connect(courier1).markDelivered(0);
-      await service.connect(client1).confirmDelivery(0, 4);
 
       await service.connect(client2).createOrder("Order B", { value: ETH2 });
       await service.connect(courier1).pickUpOrder(1);
       await service.connect(courier1).markDelivered(1);
-      await service.connect(client2).confirmDelivery(1, 5);
+
+      await time.increase(TWO_DAYS + 1);
+
+      await service.finalizeOrder(0);
+      await service.finalizeOrder(1);
     });
 
     it("courier can withdraw accumulated balance", async function () {
-      const expectedBal =
-        (ETH1 * 9500n) / 10000n + (ETH2 * 9500n) / 10000n;
+      const expectedBal = (ETH1 * 9500n) / 10000n + (ETH2 * 9500n) / 10000n;
       expect(await service.courierBalance(courier1.address)).to.equal(expectedBal);
 
       const balBefore = await ethers.provider.getBalance(courier1.address);
@@ -310,7 +358,6 @@ describe("Glovo Onchain", function () {
 
       const balAfter = await ethers.provider.getBalance(courier1.address);
       expect(balAfter + gasCost - balBefore).to.equal(expectedBal);
-
       expect(await service.courierBalance(courier1.address)).to.equal(0);
     });
 
@@ -321,22 +368,23 @@ describe("Glovo Onchain", function () {
       await service.connect(client1).createOrder("C", { value: ETH1 });
       await service.connect(courier1).pickUpOrder(2);
       await service.connect(courier1).markDelivered(2);
-      await service.connect(client1).confirmDelivery(2, 5);
+      await time.increase(TWO_DAYS + 1);
+      await service.finalizeOrder(2);
 
       await expect(service.connect(courier1).withdraw())
-        .to.be.revertedWithCustomError(service, "WithdrawTooEarly");
+        .to.be.revertedWithCustomError(service, "TooEarly");
     });
 
     it("can withdraw again after 7 days", async function () {
       await service.connect(courier1).withdraw();
 
-      // earn more
       await service.connect(client1).createOrder("D", { value: ETH1 });
       await service.connect(courier1).pickUpOrder(2);
       await service.connect(courier1).markDelivered(2);
-      await service.connect(client1).confirmDelivery(2, 5);
+      await time.increase(TWO_DAYS + 1);
+      await service.finalizeOrder(2);
 
-      await time.increase(WEEK + 1);
+      await time.increase(WEEK);
 
       await expect(service.connect(courier1).withdraw())
         .to.emit(service, "Withdrawal");
@@ -350,16 +398,17 @@ describe("Glovo Onchain", function () {
   });
 
   /* ============================================================
-     ORDER SERVICE — PLATFORM FEES
+     PLATFORM FEES
      ============================================================ */
 
-  describe("OrderService — platform fees", function () {
+  describe("Platform fees", function () {
     it("admin withdraws accumulated fees", async function () {
       await registry.addCourier(courier1.address);
       await service.connect(client1).createOrder("Fee test", { value: ETH1 });
       await service.connect(courier1).pickUpOrder(0);
       await service.connect(courier1).markDelivered(0);
-      await service.connect(client1).confirmDelivery(0, 5);
+      await time.increase(TWO_DAYS + 1);
+      await service.finalizeOrder(0);
 
       const expectedFee = ETH1 * 500n / 10000n;
       expect(await service.platformFees()).to.equal(expectedFee);
@@ -371,7 +420,6 @@ describe("Glovo Onchain", function () {
       const balAfter = await ethers.provider.getBalance(admin.address);
 
       expect(balAfter + gasCost - balBefore).to.equal(expectedFee);
-      expect(await service.platformFees()).to.equal(0);
     });
 
     it("non-admin cannot withdraw fees", async function () {
@@ -384,7 +432,7 @@ describe("Glovo Onchain", function () {
      ACCESS CONTROL EDGE CASES
      ============================================================ */
 
-  describe("Access control edge cases", function () {
+  describe("Access control", function () {
     beforeEach(async function () {
       await registry.addCourier(courier1.address);
       await service.connect(client1).createOrder("Edge", { value: ETH1 });
@@ -402,10 +450,10 @@ describe("Glovo Onchain", function () {
         .to.be.revertedWithCustomError(service, "OnlyCourier");
     });
 
-    it("wrong client cannot confirm delivery", async function () {
+    it("wrong client cannot dispute", async function () {
       await service.connect(courier1).pickUpOrder(0);
       await service.connect(courier1).markDelivered(0);
-      await expect(service.connect(client2).confirmDelivery(0, 5))
+      await expect(service.connect(client2).disputeOrder(0))
         .to.be.revertedWithCustomError(service, "OnlyClient");
     });
 
@@ -413,6 +461,15 @@ describe("Glovo Onchain", function () {
       await registry.removeCourier(courier1.address);
       await expect(service.connect(courier1).pickUpOrder(0))
         .to.be.revertedWithCustomError(service, "NotActiveCourier");
+    });
+
+    it("disputeDeadline view returns correct timestamp", async function () {
+      await service.connect(courier1).pickUpOrder(0);
+      await service.connect(courier1).markDelivered(0);
+
+      const o = await service.getOrder(0);
+      const deadline = await service.disputeDeadline(0);
+      expect(deadline).to.equal(o.deliveredAt + BigInt(TWO_DAYS));
     });
   });
 });

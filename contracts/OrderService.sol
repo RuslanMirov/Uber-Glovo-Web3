@@ -5,19 +5,27 @@ import "./CourierRegistry.sol";
 
 /**
  * @title OrderService
- * @notice Clients create orders (pay ETH), couriers pick up & deliver,
- *         admin resolves disputes, couriers withdraw weekly.
+ * @notice Clients create orders (pay ETH), couriers pick up & mark done.
+ *         Client has 2-day window to dispute. If no dispute — money goes
+ *         to courier on finalize(). Couriers withdraw weekly.
+ *
+ *  Flow:  Created → PickedUp → Delivered ──(2 days)──→ finalize → Completed
+ *                                  │
+ *                                  ├─ disputeOrder (within 2 days)
+ *                                  │       → Disputed → Frozen → Refunded / Completed
+ *                                  │
+ *                                  └─ rateOrder (optional, within 2 days)
  */
 contract OrderService {
 
     enum Status {
         Created,     // client paid, waiting for courier
         PickedUp,    // courier accepted
-        Delivered,   // courier says delivered, waiting client confirm
-        Completed,   // client confirmed — funds credited to courier balance
-        Disputed,    // client complained
-        Frozen,      // admin froze the funds during investigation
-        Refunded,    // admin refunded to client
+        Delivered,   // courier marked done — 2-day dispute window running
+        Completed,   // finalized — funds credited to courier
+        Disputed,    // client complained within window
+        Frozen,      // admin froze during investigation
+        Refunded,    // admin refunded client
         Cancelled    // client cancelled before pickup
     }
 
@@ -26,7 +34,7 @@ contract OrderService {
         address client;
         address courier;
         uint256 amount;        // ETH paid
-        string  details;       // off-chain order description / IPFS hash
+        string  details;       // off-chain description / IPFS hash
         Status  status;
         uint256 createdAt;
         uint256 deliveredAt;
@@ -36,29 +44,32 @@ contract OrderService {
     address public admin;
 
     uint256 public nextOrderId;
-    uint256 public constant CONFIRM_WINDOW = 2 days;  // auto-complete after delivery
+    uint256 public constant DISPUTE_WINDOW = 2 days;       // client can complain within this
     uint256 public constant WITHDRAW_COOLDOWN = 7 days;
-    uint256 public constant PLATFORM_FEE_BPS = 500;   // 5 %
+    uint256 public constant PLATFORM_FEE_BPS = 500;        // 5 %
 
     mapping(uint256 => Order) public orders;
 
-    // courier address => claimable balance (after completed orders minus fee)
+    // courier address => claimable balance
     mapping(address => uint256) public balances;
     // courier address => last withdrawal timestamp
     mapping(address => uint256) public lastWithdrawal;
+    // orderId => client rating (0 = not rated)
+    mapping(uint256 => uint256) public orderRating;
 
-    uint256 public platformFees; // accumulated fees for admin
+    uint256 public platformFees;
 
     /* ───────── Events ───────── */
 
     event OrderCreated(uint256 indexed orderId, address indexed client, uint256 amount);
     event OrderPickedUp(uint256 indexed orderId, address indexed courier);
-    event OrderDelivered(uint256 indexed orderId);
-    event OrderCompleted(uint256 indexed orderId, uint256 courierPayout);
+    event OrderDelivered(uint256 indexed orderId, uint256 disputeDeadline);
+    event OrderFinalized(uint256 indexed orderId, uint256 courierPayout);
     event OrderDisputed(uint256 indexed orderId, address indexed client);
     event OrderFrozen(uint256 indexed orderId);
     event OrderRefunded(uint256 indexed orderId, address indexed client, uint256 amount);
     event OrderCancelled(uint256 indexed orderId);
+    event OrderRated(uint256 indexed orderId, uint256 score);
     event DisputeResolved(uint256 indexed orderId, bool refunded);
     event Withdrawal(address indexed courier, uint256 amount);
     event FeeWithdrawn(address indexed admin, uint256 amount);
@@ -71,9 +82,12 @@ contract OrderService {
     error InvalidStatus();
     error NotActiveCourier();
     error NoBalance();
-    error WithdrawTooEarly(uint256 availableAt);
+    error TooEarly(uint256 availableAt);
+    error TooLate();
     error TransferFailed();
     error ZeroPayment();
+    error AlreadyRated();
+    error InvalidRating();
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert OnlyAdmin();
@@ -120,23 +134,33 @@ contract OrderService {
         emit OrderCancelled(orderId);
     }
 
-    /// @notice Client confirms delivery — credits courier balance.
-    function confirmDelivery(uint256 orderId, uint256 ratingScore) external {
-        Order storage o = orders[orderId];
-        if (msg.sender != o.client) revert OnlyClient();
-        if (o.status != Status.Delivered) revert InvalidStatus();
-
-        _completeOrder(o, ratingScore);
-    }
-
-    /// @notice Client opens a dispute after courier marks delivered.
+    /// @notice Client disputes within 2-day window after delivery.
     function disputeOrder(uint256 orderId) external {
         Order storage o = orders[orderId];
         if (msg.sender != o.client) revert OnlyClient();
         if (o.status != Status.Delivered) revert InvalidStatus();
+        if (block.timestamp > o.deliveredAt + DISPUTE_WINDOW) revert TooLate();
 
         o.status = Status.Disputed;
         emit OrderDisputed(orderId, msg.sender);
+    }
+
+    /// @notice Client optionally rates courier (1-5) during dispute window.
+    ///         Does NOT block finalization — just records a score.
+    function rateOrder(uint256 orderId, uint256 score) external {
+        Order storage o = orders[orderId];
+        if (msg.sender != o.client) revert OnlyClient();
+        // can rate while Delivered or after Completed
+        if (o.status != Status.Delivered && o.status != Status.Completed) revert InvalidStatus();
+        if (orderRating[orderId] != 0) revert AlreadyRated();
+        if (score < 1 || score > 5) revert InvalidRating();
+
+        orderRating[orderId] = score;
+
+        uint256 tokenId = registry.courierToken(o.courier);
+        registry.addRating(tokenId, score);
+
+        emit OrderRated(orderId, score);
     }
 
     /* ═══════════════════  COURIER ACTIONS  ═══════════════════ */
@@ -152,7 +176,7 @@ contract OrderService {
         emit OrderPickedUp(orderId, msg.sender);
     }
 
-    /// @notice Courier marks order as delivered — starts confirm window.
+    /// @notice Courier marks order as done — starts 2-day dispute window.
     function markDelivered(uint256 orderId) external {
         Order storage o = orders[orderId];
         if (msg.sender != o.courier) revert OnlyCourier();
@@ -160,18 +184,19 @@ contract OrderService {
 
         o.status = Status.Delivered;
         o.deliveredAt = block.timestamp;
-        emit OrderDelivered(orderId);
+        emit OrderDelivered(orderId, block.timestamp + DISPUTE_WINDOW);
     }
 
-    /// @notice Anyone can trigger auto-complete after confirm window.
-    function autoComplete(uint256 orderId) external {
+    /// @notice Anyone can finalize after dispute window expires.
+    ///         Credits courier balance (minus 5% fee).
+    function finalizeOrder(uint256 orderId) external {
         Order storage o = orders[orderId];
         if (o.status != Status.Delivered) revert InvalidStatus();
-        if (block.timestamp < o.deliveredAt + CONFIRM_WINDOW) {
-            revert WithdrawTooEarly(o.deliveredAt + CONFIRM_WINDOW);
+        if (block.timestamp < o.deliveredAt + DISPUTE_WINDOW) {
+            revert TooEarly(o.deliveredAt + DISPUTE_WINDOW);
         }
 
-        _completeOrder(o, 5); // default 5-star if client never responded
+        _completeOrder(o);
     }
 
     /// @notice Courier withdraws accumulated balance (once per 7 days).
@@ -181,7 +206,7 @@ contract OrderService {
         if (bal == 0) revert NoBalance();
 
         uint256 nextAllowed = lastWithdrawal[msg.sender] + WITHDRAW_COOLDOWN;
-        if (block.timestamp < nextAllowed) revert WithdrawTooEarly(nextAllowed);
+        if (block.timestamp < nextAllowed) revert TooEarly(nextAllowed);
 
         balances[msg.sender] = 0;
         lastWithdrawal[msg.sender] = block.timestamp;
@@ -215,7 +240,7 @@ contract OrderService {
             if (!ok) revert TransferFailed();
             emit OrderRefunded(orderId, o.client, o.amount);
         } else {
-            _completeOrder(o, 0); // no rating bump on forced resolution
+            _completeOrder(o);
         }
 
         emit DisputeResolved(orderId, refund);
@@ -235,7 +260,7 @@ contract OrderService {
 
     /* ═══════════════════  INTERNAL  ═══════════════════ */
 
-    function _completeOrder(Order storage o, uint256 ratingScore) internal {
+    function _completeOrder(Order storage o) internal {
         uint256 fee = (o.amount * PLATFORM_FEE_BPS) / 10_000;
         uint256 payout = o.amount - fee;
 
@@ -243,14 +268,11 @@ contract OrderService {
         balances[o.courier] += payout;
         o.status = Status.Completed;
 
-        // update courier NFT stats
+        // bump courier order count on NFT
         uint256 tokenId = registry.courierToken(o.courier);
-        if (ratingScore > 0 && ratingScore <= 5) {
-            registry.addRating(tokenId, ratingScore);
-        }
         registry.incrementOrders(tokenId);
 
-        emit OrderCompleted(o.id, payout);
+        emit OrderFinalized(o.id, payout);
     }
 
     /* ═══════════════════  VIEWS  ═══════════════════ */
@@ -265,5 +287,9 @@ contract OrderService {
 
     function nextWithdrawTime(address courier) external view returns (uint256) {
         return lastWithdrawal[courier] + WITHDRAW_COOLDOWN;
+    }
+
+    function disputeDeadline(uint256 orderId) external view returns (uint256) {
+        return orders[orderId].deliveredAt + DISPUTE_WINDOW;
     }
 }
